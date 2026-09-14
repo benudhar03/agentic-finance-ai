@@ -1,23 +1,4 @@
 services:
-  postgres:
-    image: pgvector/pgvector:pg18
-    container_name: finance-ai-postgres
-    restart: unless-stopped
-    environment:
-      POSTGRES_DB: finance
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-P@ssw0rd}
-    ports:
-      - "5432:5432"
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-      - ./db-init:/docker-entrypoint-initdb.d
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d finance"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-
   kafka:
     image: apache/kafka:4.1.2
     container_name: finance-ai-kafka
@@ -63,22 +44,31 @@ services:
     container_name: finance-ai-service
     restart: unless-stopped
     depends_on:
-      postgres:
-        condition: service_healthy
       kafka:
         condition: service_healthy
     environment:
-      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/finance
+      # host.docker.internal resolves to your Windows host machine from inside
+      # the container (Docker Desktop feature) — this is how the containerized
+      # app reaches the Postgres instance running locally on your machine.
+      SPRING_DATASOURCE_URL: jdbc:postgresql://host.docker.internal:5432/finance
       SPRING_DATASOURCE_USERNAME: postgres
-      SPRING_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD:-P@ssw0rd}
+      SPRING_DATASOURCE_PASSWORD: P@ssw0rd
       SPRING_KAFKA_BOOTSTRAP_SERVERS: finance-ai-kafka:29092
       OPENAI_API_KEY: ${OPENAI_API_KEY}
     ports:
       - "9090:9090"
+    extra_hosts:
+      # Belt-and-suspenders: guarantees host.docker.internal resolves even on
+      # Linux Docker Engine setups where it isn't automatic (Docker Desktop
+      # on Windows/Mac already provides this, but this line is harmless either way).
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9090/actuator/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
 
-  # Optional but genuinely useful during development — a browser UI to inspect
-  # topics, consumer group lag, and messages without any CLI tooling.
-  # Remove this service entirely if you don't want it.
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
     container_name: finance-ai-kafka-ui
@@ -93,5 +83,4 @@ services:
       - "8089:8080"
 
 volumes:
-  pgdata:
   kafka-data:

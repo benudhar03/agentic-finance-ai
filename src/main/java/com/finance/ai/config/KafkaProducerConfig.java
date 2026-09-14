@@ -1,6 +1,5 @@
 package com.finance.ai.config;
 
-import org.apache.kafka.clients.producer.ProducerConfig;
 import org.springframework.boot.kafka.autoconfigure.KafkaProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;

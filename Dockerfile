@@ -20,9 +20,13 @@ WORKDIR /app
 
 # Run as a non-root user
 RUN addgroup --system spring && adduser --system --ingroup spring spring
-USER spring:spring
 
-COPY --from=build /app/target/*.jar app.jar
+# --chown here (not just `USER` before COPY) is what actually makes the jar
+# owned by the spring user — USER only affects the process's runtime identity,
+# not the ownership of files copied afterward.
+COPY --from=build --chown=spring:spring /app/target/*.jar app.jar
+
+USER spring:spring
 
 EXPOSE 9090
 
