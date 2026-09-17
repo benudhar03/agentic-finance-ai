@@ -83,6 +83,7 @@ logging:
 app:
   security:
     google-client-id: ${GOOGLE_CLIENT_ID}
+    audit-encryption-key: ${AUDIT_ENCRYPTION_KEY}
   ai:
     system-prompt: >
       You are a knowledgeable financial assistant for a finance application.

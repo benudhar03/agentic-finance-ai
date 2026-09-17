@@ -69,8 +69,10 @@ public class IntentClassifierService {
         }
 
         QueryIntentResult result = parse(raw, userMessage);
-        log.info("INTENT CLASSIFIED: message=\"{}\" -> intent={}, requiresDocumentRetrieval={}, enrichedQuery=\"{}\"",
-                userMessage, result.intent(), result.requiresDocumentRetrieval(), result.enrichedQuery());
+        log.info("INTENT CLASSIFIED: conversationTurn intent={}, requiresDocumentRetrieval={}, messageLength={}, enrichedLength={}",
+                result.intent(), result.requiresDocumentRetrieval(),
+                userMessage != null ? userMessage.length() : 0,
+                result.enrichedQuery() != null ? result.enrichedQuery().length() : 0);
         return result;
     }
 

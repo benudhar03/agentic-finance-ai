@@ -1,5 +1,6 @@
 package com.finance.ai.memory.model;
 
+import com.finance.ai.crypto.EncryptedStringConverter;
 import com.finance.ai.model.MessageRole;
 import jakarta.persistence.*;
 import lombok.*;
@@ -25,6 +26,7 @@ public class ConversationMessageAudit {
     @Column(nullable = false)
     private MessageRole role;
 
+    @Convert(converter = EncryptedStringConverter.class)
     @Column(nullable = false, columnDefinition = "TEXT")
     private String content;
 

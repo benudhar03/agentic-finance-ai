@@ -52,9 +52,11 @@ services:
       # app reaches the Postgres instance running locally on your machine.
       SPRING_DATASOURCE_URL: jdbc:postgresql://host.docker.internal:5432/finance
       SPRING_DATASOURCE_USERNAME: postgres
-      SPRING_DATASOURCE_PASSWORD: P@ssw0rd
+      SPRING_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD}
       SPRING_KAFKA_BOOTSTRAP_SERVERS: finance-ai-kafka:29092
       OPENAI_API_KEY: ${OPENAI_API_KEY}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
+      AUDIT_ENCRYPTION_KEY: ${AUDIT_ENCRYPTION_KEY}
     ports:
       - "9090:9090"
     extra_hosts:
