@@ -57,6 +57,7 @@ spring:
         delivery.timeout.ms: 30000
         request.timeout.ms: 10000
         linger.ms: 5
+        batch.size: 16384
         compression.type: snappy
     consumer:
       group-id: finance-ai-service-ingestion
@@ -64,6 +65,11 @@ spring:
       value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
       auto-offset-reset: earliest
       enable-auto-commit: false
+
+      max-poll-records: 500
+      max-poll-interval-ms: 300000
+      fetch-min-bytes: 1
+      fetch-max-wait-ms: 500
       properties:
         spring.json.trusted.packages: "com.finance.ai.events"
         spring.json.value.default.type: com.finance.ai.events.DocumentUploadedEvent
@@ -96,9 +102,11 @@ app:
   ingestion:
     topic: document-uploaded
     dlt-topic: document-uploaded.DLT
-    max-retry-attempts: 3
+    max-retry-attempts: 4
+    retry-multiplier: 2.0
     retry-backoff-ms: 2000
     publish-timeout-ms: 10000
+    retry-initial-delay-ms: 1000
   storage:
     pending-uploads-dir: ${PENDING_UPLOADS_DIR:/tmp/finance-ai-pending-uploads}
 

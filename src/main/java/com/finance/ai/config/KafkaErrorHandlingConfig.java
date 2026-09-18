@@ -6,7 +6,7 @@ import org.springframework.context.annotation.Configuration;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.kafka.listener.DeadLetterPublishingRecoverer;
 import org.springframework.kafka.listener.DefaultErrorHandler;
-import org.springframework.util.backoff.FixedBackOff;
+import org.springframework.kafka.support.ExponentialBackOffWithMaxRetries;
 
 @Configuration
 public class KafkaErrorHandlingConfig {
@@ -14,11 +14,18 @@ public class KafkaErrorHandlingConfig {
     @Bean
     public DefaultErrorHandler kafkaErrorHandler(
             KafkaTemplate<String, Object> kafkaTemplate,
-            @Value("${app.ingestion.max-retry-attempts}") long maxAttempts,
-            @Value("${app.ingestion.retry-backoff-ms}") long backoffMs) {
+            @Value("${app.ingestion.max-retry-attempts:4}") int maxAttempts,
+            @Value("${app.ingestion.retry-initial-delay-ms:1000}") long initialDelayMs,
+            @Value("${app.ingestion.retry-multiplier:2.0}") double multiplier) {
 
         var recoverer = new DeadLetterPublishingRecoverer(kafkaTemplate);
-        var backOff = new FixedBackOff(backoffMs, maxAttempts - 1); // -1 since first attempt isn't a "retry"
+
+        // maxRetries excludes the original invocation — pass (maxAttempts - 1)
+        // so "4 attempts" here matches the same total-attempts meaning as
+        // @RetryableTopic's `attempts` attribute would have given you.
+        var backOff = new ExponentialBackOffWithMaxRetries(maxAttempts - 1);
+        backOff.setInitialInterval(initialDelayMs);
+        backOff.setMultiplier(multiplier);
 
         return new DefaultErrorHandler(recoverer, backOff);
     }
