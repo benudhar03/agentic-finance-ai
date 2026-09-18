@@ -1,5 +1,7 @@
 package com.finance.ai.chat.service;
 
+import com.finance.ai.agent.AgentRegistry;
+import com.finance.ai.agent.FinanceAgent;
 import com.finance.ai.agent.IntentClassifierService;
 import com.finance.ai.agent.model.QueryIntent;
 import com.finance.ai.agent.model.QueryIntentResult;
@@ -9,15 +11,12 @@ import com.finance.ai.exception.LlmUnavailableException;
 import com.finance.ai.exception.PromptGuardException;
 import com.finance.ai.guardrail.OutputGuardService;
 import com.finance.ai.guardrail.PromptGuardService;
-import com.finance.ai.llm.service.ResilientLlmGateway;
 import com.finance.ai.memory.service.ConversationAuditService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
 import java.util.UUID;
-import java.util.concurrent.CompletableFuture;
-import java.util.function.Supplier;
 
 @Slf4j
 @Service
@@ -26,11 +25,12 @@ public class ChatService {
 
     private static final int HISTORY_MESSAGE_LIMIT = 5;
 
-    private final ResilientLlmGateway llmGateway;
+    private final AgentRegistry agentRegistry;
     private final ConversationAuditService auditService;
-    private final IntentClassifierService intentClassifierService;
     private final PromptGuardService promptGuardService;
     private final OutputGuardService outputGuardService;
+    private final IntentClassifierService intentClassifierService;
+
 
     public ChatResponse handleChat(ChatRequest request) {
         UUID conversationId = auditService.resolveConversation(request);
@@ -57,7 +57,8 @@ public class ChatService {
         String history = auditService.getRecentHistory(conversationId, HISTORY_MESSAGE_LIMIT);
         QueryIntentResult intentResult = intentClassifierService.classify(request.getMessage(), history);
 
-        // Short-circuit before any expensive/risky LLM generation call
+        // Deterministic, non-agent paths — safety-critical enough that a scripted
+        // response is preferable to an LLM-generated one, every time.
         if (intentResult.intent() == QueryIntent.OUT_OF_SCOPE) {
             return shortCircuit(request, conversationId,
                     "I'm focused on personal finance topics — I'm not able to help with that here.");
@@ -67,14 +68,21 @@ public class ChatService {
                     "I can explain the concepts involved, but personalized investment, tax, or legal advice needs a licensed professional — I'd recommend speaking with one for your specific situation.");
         }
 
-        boolean useRag = forceRag || intentResult.requiresDocumentRetrieval();
+        QueryIntent effectiveIntent = forceRag ? QueryIntent.DOCUMENT_QA : intentResult.intent();
+        FinanceAgent agent = agentRegistry.find(effectiveIntent)
+                .orElseGet(() -> agentRegistry.find(QueryIntent.GENERAL_FINANCE_EDUCATION)
+                        .orElseThrow(() -> new IllegalStateException("No fallback agent registered")));
+
         String queryForModel = intentResult.enrichedQuery();
-
-        Supplier<CompletableFuture<String>> call = useRag
-                ? () -> llmGateway.generateGroundedReplyAsync(queryForModel, conversationId.toString())
-                : () -> llmGateway.generateReplyAsync(queryForModel, conversationId.toString());
-
-        String reply = callGuarded(call, conversationId, useRag ? "RAG" : "LLM");
+        String reply;
+        try {
+            reply = agent.respond(queryForModel, conversationId.toString());
+        } catch (LlmUnavailableException e) {
+            throw e;
+        } catch (Exception e) {
+            log.error("Agent {} failed for conversation {}", agent.getClass().getSimpleName(), conversationId, e);
+            throw new LlmUnavailableException("The assistant is temporarily unavailable. Please try again.");
+        }
 
         var outputCheck = outputGuardService.screen(reply);
         if (outputCheck.flagged()) {
@@ -83,20 +91,12 @@ public class ChatService {
         }
 
         auditService.recordExchange(conversationId, request.getMessage(), reply);
-        return new ChatResponse(reply, conversationId.toString(), useRag);
+        boolean usedRag = effectiveIntent == QueryIntent.DOCUMENT_QA;
+        return new ChatResponse(reply, conversationId.toString(), usedRag);
     }
 
     private ChatResponse shortCircuit(ChatRequest request, UUID conversationId, String reply) {
         auditService.recordExchange(conversationId, request.getMessage(), reply);
         return new ChatResponse(reply, conversationId.toString(), false);
-    }
-
-    private String callGuarded(Supplier<CompletableFuture<String>> call, UUID conversationId, String label) {
-        try {
-            return call.get().join();
-        } catch (Exception e) {
-            log.error("{} call failed for conversation {}", label, conversationId, e);
-            throw new LlmUnavailableException("The assistant is temporarily unavailable. Please try again.");
-        }
     }
 }

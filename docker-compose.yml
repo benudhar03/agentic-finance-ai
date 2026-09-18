@@ -26,7 +26,10 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      # false: topics are created explicitly by kafka-init below, with real
+      # retention settings — a typo'd topic name now fails loudly instead of
+      # silently auto-creating an unmanaged topic with default 7-day retention.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
       CLUSTER_ID: 4L6g3nShT-eMCtK--X86sw
     volumes:
       - kafka-data:/var/lib/kafka/data
@@ -37,6 +40,37 @@ services:
       retries: 15
       start_period: 30s
 
+  # One-shot job: creates document-uploaded and document-uploaded.DLT with
+  # explicit retention policies, then exits. Shows "Exited (0)" in `docker
+  # compose ps` afterward — that's success, not a failure.
+  kafka-init:
+    image: apache/kafka:4.1.2
+    container_name: finance-ai-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server finance-ai-kafka:29092 \
+          --create --if-not-exists \
+          --topic document-uploaded \
+          --partitions 3 \
+          --replication-factor 1 \
+          --config retention.ms=259200000 \
+          --config cleanup.policy=delete
+
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server finance-ai-kafka:29092 \
+          --create --if-not-exists \
+          --topic document-uploaded.DLT \
+          --partitions 3 \
+          --replication-factor 1 \
+          --config retention.ms=1209600000 \
+          --config cleanup.policy=delete
+
+        echo "Topics created."
+    restart: "no"
+
   app:
     build:
       context: .
@@ -46,6 +80,8 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
     environment:
       # host.docker.internal resolves to your Windows host machine from inside
       # the container (Docker Desktop feature) — this is how the containerized

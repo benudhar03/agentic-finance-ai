@@ -1,5 +1,6 @@
 package com.finance.ai.llm.service;
 
+import com.finance.ai.exception.LlmUnavailableException;
 import com.finance.ai.rag.service.RagChatService;
 import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;
 import io.github.resilience4j.timelimiter.annotation.TimeLimiter;
@@ -19,8 +20,8 @@ public class ResilientLlmGateway {
     private final ExecutorService llmExecutor;
 
     public ResilientLlmGateway(LlmService llmService,
-                                RagChatService ragChatService,
-                                @Qualifier("llmExecutor") ExecutorService llmExecutor) {
+                               RagChatService ragChatService,
+                               @Qualifier("llmExecutor") ExecutorService llmExecutor) {
         this.llmService = llmService;
         this.ragChatService = ragChatService;
         this.llmExecutor = llmExecutor;
@@ -38,6 +39,25 @@ public class ResilientLlmGateway {
     public CompletableFuture<String> generateGroundedReplyAsync(String message, String conversationId) {
         return CompletableFuture.supplyAsync(
                 () -> ragChatService.generateGroundedReply(message, conversationId), llmExecutor);
+    }
+
+    /** Blocking convenience wrapper — used by FinanceAgent implementations. */
+    public String generateReplyBlocking(String message, String conversationId) {
+        return joinOrTranslate(generateReplyAsync(message, conversationId), conversationId, "LLM");
+    }
+
+    /** Blocking convenience wrapper — used by FinanceAgent implementations. */
+    public String generateGroundedReplyBlocking(String message, String conversationId) {
+        return joinOrTranslate(generateGroundedReplyAsync(message, conversationId), conversationId, "RAG");
+    }
+
+    private String joinOrTranslate(CompletableFuture<String> future, String conversationId, String label) {
+        try {
+            return future.join();
+        } catch (Exception e) {
+            log.error("{} call failed for conversation {}", label, conversationId, e);
+            throw new LlmUnavailableException("The assistant is temporarily unavailable. Please try again.");
+        }
     }
 
     private CompletableFuture<String> llmFallback(String message, String conversationId, Throwable t) {
