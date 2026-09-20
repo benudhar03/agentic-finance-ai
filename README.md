@@ -2,7 +2,7 @@
 
 AI-powered financial intelligence service built with Java, Spring Boot, Spring AI, and OpenAI.
 
-The project is being developed as a progressive, production-oriented Finance AI platform. The implementation started with LLM-powered chat and conversation history, and has since grown to include financial calculator tools, RAG-based document grounding, LLM-based agent routing, document management, and MCP server exposure. Auth, testing, and productionization remain ahead.
+The project is being developed as a progressive, production-oriented Finance AI platform. The implementation started with LLM-powered chat and conversation history, and has since grown to include financial calculator tools, RAG-based document grounding, LLM-based agent routing, document management, MCP server exposure, and a hardened cross-cutting layer of guardrails, resilience, async ingestion, and multi-agent routing. Auth and full productionization remain ahead.
 
 ---
 
@@ -34,34 +34,59 @@ The AI service will progressively gain the ability to:
 ## Current Architecture
 
 ```text
-                    ┌─────────────────────┐
-                    │       Client        │
-                    └──────────┬──────────┘
-                               │
-                               │ REST
-                               ▼
-                    ┌─────────────────────┐
-                    │   Chat Controller   │
-                    └──────────┬──────────┘
-                               │
-                               ▼
-                    ┌─────────────────────┐
-                    │    Chat Service     │
-                    └──────────┬──────────┘
-                               │
-                    ┌──────────┴──────────┐
-                    │                     │
-                    ▼                     ▼
-             ┌─────────────┐       ┌─────────────┐
-             │ Chat Memory │       │     LLM     │
-             │ / History   │       │ Spring AI   │
-             └──────┬──────┘       └──────┬──────┘
-                    │                     │
-                    ▼                     ▼
-              PostgreSQL              OpenAI
+                              ┌─────────────────────┐
+                              │       Client         │
+                              └──────────┬──────────┘
+                                         │ REST
+                                         ▼
+                              ┌─────────────────────┐
+                              │   Chat Controller    │
+                              └──────────┬──────────┘
+                                         ▼
+                              ┌─────────────────────┐
+                              │  PromptGuardService   │  ← input screening
+                              └──────────┬──────────┘
+                                         ▼
+                              ┌─────────────────────┐
+                              │  IntentClassifierSvc  │  ← intent + query enrichment
+                              └──────────┬──────────┘
+                                         ▼
+                    ┌───────────────  AgentRegistry  ───────────────┐
+                    ▼                    ▼                    ▼                    ▼
+          GeneralEducationAgent   SmallTalkAgent      DocumentQaAgent   AccountSpecificActionAgent
+                    │                    │                    │                (stub — pending auth)
+                    └────────────────────┴──────────┬─────────┘
+                                                     ▼
+                                      ┌─────────────────────┐
+                                      │ ResilientLlmGateway   │  ← Resilience4j timeout + circuit breaker
+                                      └──────────┬──────────┘
+                                                 ▼
+                                      ┌─────────────────────┐
+                                      │  OutputGuardService   │  ← PII / account-number redaction
+                                      └──────────┬──────────┘
+                                                 ▼
+                                      ┌─────────────────────┐
+                                      │ ConversationAuditSvc  │  ← content encrypted at rest (AES-GCM)
+                                      └──────────┬──────────┘
+                                                 ▼
+                                             PostgreSQL
+
+  Document upload (async, via Kafka):
+
+  Client → DocumentController → PendingUploadStorage + PENDING row → Kafka (document-uploaded)
+                                                                            │
+                                                          DocumentIngestionConsumer (manual ack)
+                                                                            │
+                                                          DocumentIngestionService.processIngestion
+                                                                            │
+                                                    PDF parse → chunk → embed → pgvector (status → READY/FAILED)
+                                                                            │
+                                                   on repeated failure → document-uploaded.DLT (14-day retention)
 ```
 
-The architecture will evolve into:
+RAG retrieval (`DocumentQaAgent` → `RagChatService`) performs its own `vectorStore.similaritySearch(...)` rather than using Spring AI's `QuestionAnswerAdvisor` directly, so each retrieved chunk can be screened by `PromptGuardService.screenRetrievedContent(...)` before being assembled into the prompt — uploaded documents are treated as untrusted content, the same as user input.
+
+The architecture will continue to evolve toward:
 
 ```text
 Client
@@ -70,11 +95,11 @@ Client
 Finance AI Service
   │
   ▼
-AI Orchestrator / Agent
+AI Orchestrator / Agent Registry
   │
   ├──────────────► LLM
   │
-  ├──────────────► Conversation Memory
+  ├──────────────► Conversation Memory (encrypted)
   │
   ├──────────────► Financial Tools
   │
@@ -93,21 +118,21 @@ AI Orchestrator / Agent
 | Area | Technology |
 |---|---|
 | Language | Java 21 |
-| Framework | Spring Boot |
+| Framework | Spring Boot 4.1.x (Spring Framework 7) |
 | AI Framework | Spring AI |
 | LLM | OpenAI |
 | API | REST |
-| Persistence | PostgreSQL |
+| API Docs | springdoc-openapi (Swagger UI) |
+| Persistence | PostgreSQL + pgvector |
 | ORM | Spring Data JPA / Hibernate |
-| Conversation Memory | Spring AI Chat Memory |
+| Conversation Memory | Spring AI Chat Memory (JDBC-backed) + encrypted audit trail |
+| Async Messaging | Apache Kafka (KRaft, `spring-boot-starter-kafka`) |
+| Resilience | Resilience4j (timeout, circuit breaker, rate limiter) |
 | Build | Maven |
 | Boilerplate Reduction | Lombok |
-| Observability | Spring Boot Actuator |
-| Future Messaging | Kafka |
+| Observability | Spring Boot Actuator, Micrometer/Prometheus |
 | Future Cache | Redis |
-| Future Integration | MCP |
-| Future Knowledge Retrieval | RAG |
-| Future Orchestration | Agentic AI |
+| Future Integration | MCP client (server-side MCP already exposed) |
 | Future Deployment | Docker / Kubernetes / AWS |
 
 ---
@@ -143,13 +168,29 @@ finance-ai-service
 │   │   │               ├── chat
 │   │   │               │   ├── controller     (ChatController, ConversationController)
 │   │   │               │   ├── dto            (ChatRequest, ChatResponse, CreateConversationRequest, ConversationResponse, MessageResponse)
-│   │   │               │   └── service        (ChatService)
+│   │   │               │   └── service        (ChatService — dispatches through AgentRegistry)
+│   │   │               │
+│   │   │               ├── agent
+│   │   │               │   ├── FinanceAgent            (interface: supportedIntent, respond)
+│   │   │               │   ├── AgentRegistry            (intent → agent dispatch)
+│   │   │               │   ├── IntentClassifierService  (intent classification + query enrichment)
+│   │   │               │   ├── model           (QueryIntent, QueryIntentResult)
+│   │   │               │   └── impl            (GeneralEducationAgent, SmallTalkAgent,
+│   │   │               │                         DocumentQaAgent, AccountSpecificActionAgent [stub])
+│   │   │               │
+│   │   │               ├── guardrail
+│   │   │               │   ├── PromptGuardService   (input screening + RAG-chunk injection screening)
+│   │   │               │   └── OutputGuardService   (PII / account-number redaction on LLM output)
+│   │   │               │
+│   │   │               ├── ratelimit
+│   │   │               │   └── ChatRateLimitInterceptor  (per-client, per-endpoint rate limiting)
 │   │   │               │
 │   │   │               ├── llm
 │   │   │               │   ├── config         (LlmConfig — ChatClient bean, tools, advisors)
-│   │   │               │   └── service         (LlmService)
+│   │   │               │   └── service        (LlmService, ResilientLlmGateway — timeout + circuit breaker)
 │   │   │               │
 │   │   │               ├── memory
+│   │   │               │   ├── crypto         (EncryptedStringConverter — AES-GCM audit encryption)
 │   │   │               │   ├── model          (Conversation, ConversationMessageAudit)
 │   │   │               │   ├── repository     (ConversationRepository, ConversationMessageAuditRepository)
 │   │   │               │   └── service        (ConversationAuditService, MemoryService)
@@ -161,28 +202,36 @@ finance-ai-service
 │   │   │               │   └── config         (McpToolConfig — exposes tools via MCP server)
 │   │   │               │
 │   │   │               ├── rag
-│   │   │               │   ├── controller     (DocumentController)
-│   │   │               │   ├── dto            (IngestResponse, DocumentSummary)
-│   │   │               │   ├── model          (UploadedDocument)
+│   │   │               │   ├── controller     (DocumentController — async upload + status endpoint)
+│   │   │               │   ├── dto            (IngestResponse, DocumentSummary — now status-aware)
+│   │   │               │   ├── model          (UploadedDocument, DocumentStatus)
 │   │   │               │   ├── repository     (DocumentRepository)
-│   │   │               │   └── service        (DocumentIngestionService, RagChatService)
+│   │   │               │   └── service        (DocumentIngestionService, DocumentIngestionEventProducer,
+│   │   │               │                         DocumentIngestionConsumer, PendingUploadStorage,
+│   │   │               │                         PdfFileValidator, RagChatService — chunk-screening)
 │   │   │               │
-│   │   │               ├── agent
-│   │   │               │   └── service        (IntentClassifierService — RAG-vs-chat routing)
+│   │   │               ├── events
+│   │   │               │   └── DocumentUploadedEvent   (Kafka event payload)
 │   │   │               │
 │   │   │               ├── exception          (LlmUnavailableException, ConversationNotFoundException,
-│   │   │               │                        DocumentNotFoundException, GlobalExceptionHandler)
+│   │   │               │                        DocumentNotFoundException, InvalidFileException,
+│   │   │               │                        PromptGuardException, EventPublishException,
+│   │   │               │                        GlobalExceptionHandler)
 │   │   │               │
 │   │   │               ├── model              (MessageRole)
 │   │   │               │
-│   │   │               └── config
+│   │   │               └── config             (KafkaProducerConfig, KafkaErrorHandlingConfig,
+│   │   │                                         RateLimiterConfigBeans)
 │   │   │
 │   │   └── resources
-│   │       └── application.yaml
+│   │       ├── application.yaml
+│   │       └── application-local.yaml   (host-run app against dockerized Kafka)
 │   │
 │   └── test
 │
 ├── pom.xml
+├── Dockerfile               (multi-stage build, non-root user, --chown fix applied)
+├── docker-compose.yml       (Kafka KRaft + kafka-init + kafka-ui + app; local Postgres via host.docker.internal)
 ├── mvnw
 ├── mvnw.cmd
 ├── .gitignore
@@ -215,391 +264,174 @@ ChatClient
 OpenAI
 ```
 
-Expected API:
-
-```http
-POST /api/chat
-```
-
-Example:
-
-```json
-{
-  "message": "Explain what an emergency fund is in simple terms."
-}
-```
-
----
-
 ## Phase 2 — LLM & Prompt Engineering
 
-Introduce:
-
-- System prompts
-- Application-specific instructions
-- Temperature/model configuration
-- Prompt templates
-- Response handling
-- Error handling
-- LLM abstraction
-
-Example system behavior:
-
-```text
-You are a knowledgeable financial assistant.
-
-Provide clear, accurate, and educational information
-about personal finance, investing concepts, budgeting,
-and markets.
-
-Do not provide personalized investment, tax, or legal advice.
-Do not fabricate financial figures or facts.
-```
-
----
+System prompts, temperature/model configuration, prompt templates, response handling, error handling, LLM abstraction.
 
 ## Phase 3 — Conversation Memory
 
-The assistant should understand context across multiple messages.
-
-Example:
-
-```text
-User:
-My monthly income is ₹1,00,000.
-
-Assistant:
-...
-
-User:
-How much should I save?
-
-Assistant:
-Based on the income you mentioned earlier...
-```
-
-Conversation history will be associated with a conversation/session identifier and persisted through the application's memory layer.
-
-Target architecture:
-
-```text
-Chat Request
-     │
-     ▼
-Conversation ID
-     │
-     ▼
-Chat Memory
-     │
-     ├── Previous Messages
-     │
-     └── Current Message
-     │
-     ▼
-LLM
-```
-
-PostgreSQL will be used for persistent application data and conversation-related storage.
-
----
+Conversation history is persisted per conversation ID, and message content is now encrypted at rest (see [Security, Guardrails & Resilience](#security-guardrails--resilience) below).
 
 ## Phase 4 — Financial Tools
 
-The LLM will move from simply generating text to using application capabilities.
-
-Planned tools include:
-
-### Account Tools
-
-```text
-getAccountBalance()
-getAccountDetails()
-```
-
-### Transaction Tools
-
-```text
-getTransactions()
-getTransactionById()
-getLargestTransactions()
-```
-
-### Analytics Tools
-
-```text
-getMonthlySpending()
-getCategorySpending()
-compareSpending()
-```
-
-Example:
-
-```text
-User:
-How much did I spend on food last month?
-
-        ↓
-
-LLM
-        ↓
-Transaction / Analytics Tool
-        ↓
-Financial Data
-        ↓
-LLM Analysis
-        ↓
-Natural Language Response
-```
-
----
+Generic financial calculator tools (EMI, compound interest, SIP) are implemented and exposed both to the LLM directly and via MCP. Real domain tools (account balance, transactions, analytics) remain ahead — `AccountSpecificActionAgent` is currently a deliberate stub pending authentication.
 
 ## Phase 5 — MCP
 
-Model Context Protocol will be introduced to standardize access to external tools and services.
-
-Conceptually:
-
-```text
-Finance AI Service
-       │
-       ▼
-   MCP Client
-       │
-       ▼
-   MCP Server
-       │
-       ├── Account Tools
-       ├── Transaction Tools
-       └── Analytics Tools
-```
-
-This allows the AI layer to interact with external capabilities without tightly coupling every tool implementation to the AI service.
-
----
+The calculator tools are exposed as an MCP server (`POST /mcp`). An MCP *client* (consuming external MCP servers) is not yet built.
 
 ## Phase 6 — RAG
 
-Retrieval-Augmented Generation will provide domain knowledge to the assistant.
-
-Potential knowledge sources:
-
-- Financial education documents
-- Product documentation
-- Banking policies
-- Finance FAQs
-- Internal finance knowledge
-- Regulatory/reference documents
-
-Flow:
-
-```text
-User Question
-     │
-     ▼
-Query Processing
-     │
-     ▼
-Embedding
-     │
-     ▼
-Vector Search
-     │
-     ▼
-Relevant Context
-     │
-     ▼
-LLM
-     │
-     ▼
-Grounded Response
-```
-
----
+Implemented, with an added guardrail layer: retrieval is performed manually (not via the built-in advisor) so each retrieved chunk can be screened for prompt-injection before being added to context. See `RagChatService`.
 
 ## Phase 7 — Agentic AI
 
-The service will evolve from a simple request/response system into an agentic workflow.
-
-Example:
-
-```text
-User:
-Why did my expenses increase this month?
-```
-
-Agent:
-
-```text
-1. Understand request
-2. Retrieve current-month expenses
-3. Retrieve previous-month expenses
-4. Compare categories
-5. Identify significant changes
-6. Retrieve relevant transactions
-7. Analyze results
-8. Generate explanation
-9. Return final response
-```
-
-Target architecture:
+Implemented as a router + specialist agent architecture:
 
 ```text
                   ┌───────────────┐
                   │     User      │
                   └───────┬───────┘
-                          │
                           ▼
                 ┌───────────────────┐
-                │ Finance AI API    │
+                │  IntentClassifier  │  (intent + query enrichment)
                 └─────────┬─────────┘
-                          │
                           ▼
                 ┌───────────────────┐
-                │ Agent Orchestrator│
+                │   AgentRegistry    │
                 └─────────┬─────────┘
-                          │
-          ┌───────────────┼────────────────┐
-          ▼               ▼                ▼
-        LLM           MCP / Tools          RAG
+          ┌───────────────┼────────────────┬──────────────────┐
+          ▼               ▼                ▼                  ▼
+  GeneralEducation    SmallTalk      DocumentQa (RAG)   AccountSpecificAction
+      Agent             Agent            Agent              (stub)
           │               │                │
-          └───────────────┼────────────────┘
+          └───────────────┴────────────────┘
                           ▼
-                ┌───────────────────┐
-                │ Finance Services  │
-                └───────────────────┘
+                ResilientLlmGateway → OpenAI
 ```
+
+`ADVICE_REQUEST` and `OUT_OF_SCOPE` intents deliberately bypass the LLM entirely and return a fixed, deterministic response — treated as safety-critical enough that a scripted answer is preferable to a generated one.
+
+---
+
+# Security, Guardrails & Resilience
+
+This layer was built across the whole request/response and ingestion path, independent of the phase roadmap above, since it cuts across chat, RAG, and document ingestion equally.
+
+### Input & request validation
+- `@Valid` enforced on all chat endpoints; `GlobalExceptionHandler` returns clean 4xx responses instead of stack traces.
+- `PdfFileValidator` checks real PDF magic bytes (not just filename/content-type) and caps upload size at 20MB before a file is ever accepted.
+
+### Prompt-injection defense
+- `PromptGuardService.screenUserInput(...)` — pattern-based screening of user messages for instruction-override attempts, applied before any LLM call.
+- `PromptGuardService.screenRetrievedContent(...)` — the same screening applied to every RAG-retrieved chunk individually. Uploaded PDFs are treated as untrusted content; a flagged chunk is excluded from context and logged with its source `document_id`, rather than failing the whole request.
+
+### Output guardrail
+- `OutputGuardService` screens LLM output for account/card-number-shaped and SSN-like patterns and redacts them before the reply reaches the client.
+
+### Resilience
+- `ResilientLlmGateway` wraps all LLM/RAG calls with Resilience4j `@TimeLimiter` + `@CircuitBreaker` (separate instances for `llmService` and `ragChatService`), backed by a dedicated bounded executor. Extracted into its own bean specifically to avoid Spring AOP's self-invocation limitation.
+- `ChatRateLimitInterceptor` applies per-client (IP-keyed, pending auth) rate limits to `/api/chat/**`, with a stricter cap on `/agent`. Built from Java `RateLimiterConfig` beans rather than YAML-driven config, to avoid a dependency on named-configuration lookup at runtime.
+
+### Async document ingestion (Kafka)
+- Upload is fire-and-confirm, not fire-and-forget: `DocumentIngestionEventProducer` blocks for broker acknowledgement (bounded by a timeout) and throws `EventPublishException` on failure, so a `202` response is only ever returned once the event has genuinely reached the broker.
+- `DocumentIngestionConsumer` uses manual offset acknowledgement, committed only after ingestion (including the DB status write) durably succeeds — a mid-processing crash results in safe redelivery, not silent message loss.
+- Failures retry with exponential backoff (`ExponentialBackOffWithMaxRetries`) and route to `document-uploaded.DLT` after repeated failure, rather than blocking the partition indefinitely or retrying forever.
+- Kafka topics are created explicitly (not auto-created) with topic-specific retention: 3 days for `document-uploaded`, 14 days for its DLT — long enough for a human to notice and investigate a failed ingestion.
+- Document status (`PENDING` → `PROCESSING` → `READY`/`FAILED`) is queryable via `GET /api/documents/{id}/status` while ingestion runs in the background.
+
+### Data protection
+- `ConversationMessageAudit.content` is encrypted at rest with AES-GCM (`EncryptedStringConverter`), keyed by an externalized `AUDIT_ENCRYPTION_KEY` — a database leak does not expose plaintext conversation history.
+- Raw message/reply content was removed from application logs (e.g. `IntentClassifierService` now logs intent and content *length*, not content itself) — logs typically ship to less-secured aggregation systems than the primary database.
+
+### Known, currently unresolved gap
+- **JWT audience validation.** `spring.security.oauth2.resourceserver.jwt.issuer-uri` validates issuer/expiry only; without an explicit `JwtDecoder` bean adding an audience check against `app.security.google-client-id`, any valid Google-issued token — not only ones minted for this app — currently authenticates successfully. This is the most significant open security item.
 
 ---
 
 # Productionization Roadmap
 
-After the AI capabilities are complete, the service will be hardened for production.
-
-Planned areas:
-
 ### Persistence
-
-- PostgreSQL
-- Database migrations
-- Transaction management
-- Indexing
-- Query optimization
+PostgreSQL, database migrations (Flyway/Liquibase — not yet adopted; `ddl-auto: update` and Spring AI's `initialize-schema: always`/`true` remain auto-DDL for now), transaction management, indexing, query optimization.
 
 ### Caching
-
-- Redis
-- Conversation/session caching
-- Frequently requested financial data
+Redis — not yet started.
 
 ### Messaging
-
-- Apache Kafka
-- Event-driven processing
-- Async workflows
-- Audit events
+Apache Kafka — **implemented** for document ingestion (see above). Broader event-driven processing (guardrail-violation events, agent tool-invocation audit trail) discussed but not yet built.
 
 ### Security
-
-- Authentication
-- Authorization
-- JWT/OAuth2
-- User-level data isolation
-- API validation
-- Secret management
+- Authentication/Authorization/JWT — partially configured (OAuth2 resource server against Google), audience validation still missing (see above).
+- User-level data isolation — not yet implemented; `userId` is currently client-supplied and unverified. Document retrieval and conversation access are not yet tenant-scoped.
+- API validation — implemented (`@Valid`, file validation, prompt/output guardrails).
+- Secret management — environment-variable based for now (`.env`, not committed); a proper secrets manager (AWS Secrets Manager, Vault) remains a future step, particularly for `AUDIT_ENCRYPTION_KEY` rotation.
 
 ### Observability
-
-- Actuator
-- Metrics
-- Structured logging
-- Distributed tracing
-- Prometheus
-- Grafana
-- Centralized logging
+Actuator + Micrometer/Prometheus configured. Structured logging, distributed tracing, Grafana dashboards, and guardrail-trigger-rate metrics remain future work.
 
 ### Deployment
-
 ```text
-Docker
+Docker (implemented — multi-stage Dockerfile, docker-compose for local Kafka + app)
    ↓
-Kubernetes
+Kubernetes (not started)
    ↓
-AWS
-```
-
-Potential AWS services:
-
-```text
-EKS
-RDS
-ElastiCache
-S3
-CloudWatch
-Secrets Manager
-MSK
+AWS (not started)
 ```
 
 ---
 
 # Configuration
 
-The application uses environment variables for secrets.
-
-Example:
+The application uses environment variables for secrets. Required variables:
 
 ```text
 OPENAI_API_KEY
-OPENAI_MODEL
-DB_USERNAME
-DB_PASSWORD
+POSTGRES_PASSWORD
+GOOGLE_CLIENT_ID
+AUDIT_ENCRYPTION_KEY       # generate with: openssl rand -base64 32
 ```
 
-Do not commit secrets to source control.
-
-Example PowerShell configuration:
-
-```powershell
-$env:OPENAI_API_KEY="your-api-key"
-$env:OPENAI_MODEL="gpt-4o-mini"
-$env:DB_USERNAME="postgres"
-$env:DB_PASSWORD="your-password"
-```
+Do not commit secrets to source control. `.env` should be in `.gitignore`.
 
 ---
 
 # Running Locally
 
-Build the project:
+## Option A — Fully containerized (Kafka + app)
 
 ```bash
-mvn clean test
+docker compose up -d --build
+docker compose ps   # confirm kafka, kafka-ui, app all show (healthy)
 ```
+App reachable at `http://localhost:9090` (or whatever host port is mapped in `docker-compose.yml`).
 
-Run the application:
+## Option B — Kafka in Docker, app run locally (recommended for active debugging)
 
 ```bash
-mvn spring-boot:run
+docker compose up -d kafka kafka-init kafka-ui
 ```
 
-Run using the local profile:
+Then run the app with the `local` profile active (overrides Kafka/datasource hosts to `localhost`):
 
 ```bash
-mvn spring-boot:run -Dspring-boot.run.profiles=local
+SPRING_PROFILES_ACTIVE=local ./mvnw spring-boot:run
 ```
+
+(or set `SPRING_PROFILES_ACTIVE=local` plus the required secrets as environment variables in your IDE's run configuration)
 
 ---
 
 # API Reference
 
-All endpoints are served under `http://localhost:9090`.
+All endpoints are served under `http://localhost:9090` (or the mapped Docker port).
 
 ## Chat
 
 | Method | Path | Description |
 |---|---|---|
-| POST | `/api/chat` | Plain chat (calculator tools available, no document retrieval) |
+| POST | `/api/chat` | Chat, routed through intent classification and the agent registry |
 | POST | `/api/chat/rag` | Chat with retrieval always applied against uploaded documents |
-| POST | `/api/chat/agent` | Chat with LLM-based routing — automatically decides whether to use RAG |
+| POST | `/api/chat/agent` | Chat with full intent-based agent routing |
 
 Request body (all three):
 ```json
@@ -609,17 +441,15 @@ Request body (all three):
   "userId": null
 }
 ```
-`conversationId` may be omitted/null to start a new conversation, or set to an existing conversation's id to continue it (an unknown id returns `404`).
 
 Response body:
 ```json
 {
   "reply": "...",
   "conversationId": "b7e2...",
-  "classifiedAsRag": null
+  "classifiedAsRag": true
 }
 ```
-`classifiedAsRag` is only populated (`true`/`false`) for `/api/chat/agent` responses; it is `null` for the two explicit endpoints.
 
 ## Conversations
 
@@ -628,29 +458,22 @@ Response body:
 | POST | `/api/conversations` | Explicitly create a new, empty conversation |
 | GET | `/api/conversations/{id}/messages` | Fetch full message history for a conversation, chronological |
 
-## Documents (RAG)
+## Documents (RAG, async via Kafka)
 
 | Method | Path | Description |
 |---|---|---|
-| POST | `/api/documents/upload` | Upload a PDF (multipart, field name `file`) for ingestion into the vector store |
-| GET | `/api/documents` | List all uploaded documents with chunk counts and upload timestamps |
+| POST | `/api/documents/upload` | Upload a PDF (multipart, field `file`) — returns `202` once queued, not once processed |
+| GET | `/api/documents/{id}/status` | Poll ingestion status: `PENDING` → `PROCESSING` → `READY`/`FAILED` |
+| GET | `/api/documents` | List all uploaded documents with status, chunk counts, upload timestamps |
 | DELETE | `/api/documents/{id}` | Delete a document and its associated vector store chunks |
 
 ## MCP
 
-The finance calculator tools (`calculateEmi`, `calculateCompoundInterest`, `calculateSip`) are also exposed as an MCP server at:
-
-```http
-POST http://localhost:9090/mcp
-```
-
-Any MCP-compatible client can discover and invoke them via standard JSON-RPC (`tools/list`, `tools/call`).
+Finance calculator tools (`calculateEmi`, `calculateCompoundInterest`, `calculateSip`) are exposed as an MCP server at `POST http://localhost:9090/mcp`.
 
 ---
 
 # Health Check
-
-With Actuator enabled:
 
 ```http
 GET http://localhost:9090/actuator/health
@@ -658,25 +481,45 @@ GET http://localhost:9090/actuator/health
 
 ---
 
-# Configuration Profiles
-
-## Local
+# Current Implementation Status
 
 ```text
-application-local.yml
+[✓] Project foundation
+[✓] Spring Boot application (Spring Boot 4.1.x / Spring Framework 7)
+[✓] LLM configuration (ChatClient, system prompt, chat memory advisor)
+[✓] OpenAI integration (chat + embeddings)
+[✓] Chat API — tested
+[✓] Conversation lifecycle (create, resolve, 404 on unknown id) — tested
+[✓] Persistent conversation history — tested, content encrypted at rest (AES-GCM)
+[✓] Financial calculator tools (EMI, compound interest, SIP) — tested
+[✓] RAG ingestion (PDF → chunks → pgvector), now async via Kafka — tested
+[✓] Vector retrieval with per-chunk prompt-injection screening — tested
+[✓] Intent classification + query enrichment (standalone-query rewriting) — tested
+[✓] Multi-agent routing (AgentRegistry + per-intent specialist agents) — tested
+[✓] Document management (list, status polling, delete with vector cleanup) — tested
+[✓] MCP server exposure (calculator tools via MCP protocol) — tested
+[✓] Input validation + centralized exception handling
+[✓] Prompt-injection guardrail (user input + RAG-retrieved content)
+[✓] Output guardrail (PII / account-number redaction)
+[✓] Resilience4j timeout + circuit breaker on all LLM/RAG calls
+[✓] Rate limiting on chat endpoints (per-client, stricter on /agent)
+[✓] Kafka async document ingestion — producer confirmation, manual-ack consumer,
+    retry + DLT, explicit topic retention policy
+[✓] Audit log encryption at rest (AES-GCM)
+[✓] Docker (multi-stage build, non-root user, docker-compose for local Kafka)
+
+[ ] Financial account/transaction/analytics tools (real domain data — AccountSpecificActionAgent is currently a stub)
+[ ] MCP client (consuming external MCP servers)
+[ ] Security / Auth — userId is currently a trusted, unverified client-supplied string;
+    JWT audience validation not yet implemented (most significant open security gap)
+[ ] User-level / tenant-level data isolation on RAG retrieval and conversation access
+[ ] Redis caching
+[ ] Broader event-driven processing (guardrail-violation events, agent tool-invocation audit trail)
+[ ] Observability stack (structured logging, tracing, guardrail-trigger-rate metrics, dashboards)
+[ ] Integration test suite (Testcontainers)
+[ ] Kubernetes
+[ ] AWS deployment
 ```
-
-Used for local development.
-
-## Production
-
-```text
-application-prod.yml
-```
-
-Used for production-specific configuration.
-
-Secrets and environment-specific values should be supplied through environment variables or a secure secret-management system.
 
 ---
 
@@ -686,21 +529,19 @@ The assistant is designed to provide educational financial information.
 
 It should:
 
-- Clearly distinguish education from personalized financial advice.
-- Avoid fabricating account balances or transactions.
+- Clearly distinguish education from personalized financial advice — enforced structurally: `ADVICE_REQUEST` intent bypasses the LLM entirely for a fixed disclaimer response.
+- Avoid fabricating account balances or transactions — `AccountSpecificActionAgent` returns an honest "not yet available" response rather than guessing, until real tools and auth exist.
 - Never invent financial figures.
 - Avoid unsupported investment recommendations.
 - Avoid pretending to have access to data it cannot retrieve.
 - Ask for clarification when required.
 - Use application tools when actual financial data is required.
-- Protect user-specific financial information.
-- Keep financial data isolated by user and conversation.
+- Protect user-specific financial information — output guardrail redacts account/card-number-shaped content; audit content is encrypted at rest.
+- Keep financial data isolated by user and conversation — **not yet fully enforced**; tenant-scoping remains an open gap (see Current Implementation Status).
 
 ---
 
 # Engineering Principles
-
-The project follows these principles:
 
 - Clean separation of concerns
 - Dependency inversion
@@ -712,45 +553,13 @@ The project follows these principles:
 - Observability from the beginning
 - Secure handling of financial data
 - Incremental architecture evolution
+- Defense in depth — guardrails are applied at multiple points (input, retrieved content, output) rather than relying on a single check
 
 The AI layer should not directly own or duplicate financial domain logic. Financial facts should come from trusted application services/tools, while the AI layer focuses on understanding, orchestration, reasoning, and response generation.
 
 ---
 
-# Current Implementation Status
-
-```text
-[✓] Project foundation
-[✓] Spring Boot application
-[✓] LLM configuration (ChatClient, system prompt, chat memory advisor)
-[✓] OpenAI integration (chat + embeddings)
-[✓] Chat API (/api/chat) — tested
-[✓] Conversation lifecycle (create, resolve, 404 on unknown id) — tested
-[✓] Persistent conversation history (GET /messages) — tested
-[✓] Financial calculator tools (EMI, compound interest, SIP) — tested
-[✓] RAG ingestion (PDF → chunks → pgvector) — tested
-[✓] Vector retrieval (QuestionAnswerAdvisor, /api/chat/rag) — tested
-[✓] Agentic routing (LLM-based RAG-vs-chat classification, /api/chat/agent) — tested
-[✓] Document management (list, delete with vector cleanup) — tested
-[✓] MCP server exposure (calculator tools via MCP protocol) — tested
-
-[ ] Financial account/transaction/analytics tools (real domain data — currently only generic calculators exist)
-[ ] MCP client (consuming external MCP servers)
-[ ] Security / Auth (userId is currently a trusted, unverified client-supplied string)
-[ ] Kafka/event-driven processing
-[ ] Redis caching
-[ ] Observability stack (structured logging, tracing, metrics dashboards)
-[ ] Integration test suite (Testcontainers)
-[ ] Docker
-[ ] Kubernetes
-[ ] AWS deployment
-```
-
----
-
 # Long-Term Vision
-
-The final system is intended to become a production-style AI financial assistant:
 
 ```text
                          Finance AI Platform
@@ -759,12 +568,12 @@ The final system is intended to become a production-style AI financial assistant
              │                  │                  │
              ▼                  ▼                  ▼
           LLM Layer        Memory Layer        Knowledge
-             │                  │                  │
+             │            (encrypted)               │
              │                  ▼                  ▼
-             │             PostgreSQL            RAG
-             │
+             │             PostgreSQL             RAG
+             │                                (chunk-screened)
              ▼
-       Agent Orchestrator
+     Agent Registry / Orchestrator
              │
        ┌─────┼─────┐
        ▼     ▼     ▼
